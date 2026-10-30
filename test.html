@@ -369,7 +369,7 @@ const ST = {
   file: null, kind: null, enc: 'utf-8', delim: ';', headers: [], map: null, xlsx: null,
   raw: null, rawStats: null, readMs: 0,
   ui: { tab: 'overview', gran: 'sub', coreThr: 0.8, assignThr: 0.5, minUsers: null,
-        tCov: 0.9, tExtra: 0.15, scope: null, k: 0, kManual: false, heat: 'status', heatArea: 'status', hideExc: null,
+        tCov: 0.9, tExtra: 0.15, weight: 'person', maxHeld: null, scope: null, k: 0, kManual: false, heat: 'status', heatArea: 'status', hideExc: null,
         simThr: 0.7, search: '' }
 };
 let MODEL = null;
@@ -882,16 +882,44 @@ async function buildModel(ctx) {
 /* ================================================================
    Analyse d'un périmètre (profil ou ensemble)
    ================================================================ */
-function scopeName(id) { return id < 0 ? 'Tous les profils' : MODEL.P[id]; }
+function scopeName(id) { return (id < 0 ? 'Tous les profils' : MODEL.P[id]) + (ST.ui.maxHeld ? ' (≤ ' + ST.ui.maxHeld + ' abonnements)' : ''); }
+const SCOPEC = new Map(), SIZEQ = new Map();
+function baseScope(id) { return id < 0 ? MODEL.all : MODEL.profs[id]; }
+/* Périmètre analysé, sans les personnes au-delà du seuil « périmètres très larges » */
+function scopeCSR(id) {
+  const base = baseScope(id), mx = ST.ui.maxHeld;
+  if (!mx) return base;
+  const key = id + '|' + mx; let c = SCOPEC.get(key); if (c) return c;
+  const Mb = base.members.length; let nm = 0, nl = 0, exN = 0, exL = 0;
+  for (let m = 0; m < Mb; m++) { const d = base.ptr[m + 1] - base.ptr[m]; if (d <= mx) { nm++; nl += d; } else { exN++; exL += d; } }
+  const members = new Int32Array(nm), ptr = new Int32Array(nm + 1), subs = new Int32Array(nl), rights = new Uint8Array(nl); let q = 0, o = 0;
+  for (let m = 0; m < Mb; m++) {
+    const a = base.ptr[m], b = base.ptr[m + 1]; if (b - a > mx) continue;
+    members[q] = base.members[m]; subs.set(base.subs.subarray(a, b), o); rights.set(base.rights.subarray(a, b), o); o += b - a; ptr[++q] = o;
+  }
+  c = { members, ptr, subs, rights, excluded: { n: exN, couples: exL, total: base.subs.length } };
+  SCOPEC.set(key, c); return c;
+}
+/* Taille des périmètres (abonnements par personne) et concentration des droits */
+function sizeStats(id) {
+  let r = SIZEQ.get(id); if (r) return r;
+  const base = baseScope(id), M = base.members.length, d = new Int32Array(M);
+  for (let m = 0; m < M; m++) d[m] = base.ptr[m + 1] - base.ptr[m];
+  d.sort();
+  const tot = base.subs.length, k10 = Math.max(1, Math.ceil(M * 0.1)); let top = 0;
+  for (let i = M - k10; i < M; i++) top += d[i];
+  r = { p90: M ? d[Math.max(0, M - k10 - 1)] : 0, max: M ? d[M - 1] : 0, med: M ? d[Math.floor((M - 1) / 2)] : 0, top10: tot ? top / tot : 0 };
+  SIZEQ.set(id, r); return r;
+}
 function itemName(A, i) { const k = A.itemKey[i]; return A.gran === 'sub' ? MODEL.S[k] : MODEL.S[k >> 3] + ' · ' + RL[k & 7]; }
 function itemSub(A, i) { const k = A.itemKey[i]; return A.gran === 'sub' ? MODEL.S[k] : MODEL.S[k >> 3]; }
 
-function scopeSize(id) { return id < 0 ? MODEL.all.members.length : MODEL.profs[id].members.length; }
+function scopeSize(id) { return scopeCSR(id).members.length; }
 function autoMinUsers(id) { return Math.max(2, Math.ceil((id < 0 ? 0.005 : 0.02) * scopeSize(id))); }
 function effMinUsers() { return ST.ui.minUsers ?? autoMinUsers(ST.ui.scope); }
 
 async function analyzeHeavy(ctx, scopeId, gran, coreThr, N) {
-  const scope = scopeId < 0 ? MODEL.all : MODEL.profs[scopeId];
+  const scope = scopeCSR(scopeId);
   const M = scope.members.length, ptr = scope.ptr, subs = scope.subs, rights = scope.rights, L = subs.length, nS = MODEL.nS;
   await prog(ctx, 'Préparation de l’analyse…', 0.02);
   const space = gran === 'sub' ? nS : nS * 8;
@@ -960,6 +988,9 @@ async function analyzeHeavy(ctx, scopeId, gran, coreThr, N) {
     order = order.slice(0, MAXSIG).sort((a, b) => a - b);
     cappedItems.sort(byCnt);
   }
+  let lostP = 0;
+  for (let m = 0; m < M; m++) { let c = 0; for (let j = ptr[m]; j < ptr[m + 1]; j++) if (cls[mItem[j]] >= 2) c++; lostP += c / (mHeld[m] || 1); }
+  lostP /= M || 1;
   const nSig = order.length;
   const sigW = new Float64Array(nSig), sigCnt = new Int32Array(nSig), sigItems = new Array(nSig), sA = new Int32Array(nSig), sB = new Int32Array(nSig);
   for (let s = 0; s < nSig; s++) { const o = order[s], q = sigRep[o]; sigItems[s] = sigItemsAll[o]; sigW[s] = sigItems[s].length; sA[s] = vPtr[q]; sB[s] = vPtr[q + 1]; sigCnt[s] = sB[s] - sA[s]; }
@@ -1004,7 +1035,7 @@ async function analyzeHeavy(ctx, scopeId, gran, coreThr, N) {
     lStart[v] = Math.min(lStart[a], lStart[b]); lEnd[v] = Math.max(lEnd[a], lEnd[b]); coh[v] = tree.smh[q] <= HMAX ? 1 : 0;
   }
   return {
-    kind: 'sub', lostHeld: excHeld + cappedHeld,
+    kind: 'sub', lostHeld: excHeld + cappedHeld, lostP,
     scopeId, gran, coreThr, N, M, members: scope.members, ptr, rights, mItem, nI, itemKey, cnt, rMaj, cls,
     coreList, excList, cappedItems, nCore, nVar, nExc: excList.length, nCapped: cappedItems.length,
     coreHeld, coreExtra, excHeld, cappedHeld, total: L, mHeld, mCore,
@@ -1065,6 +1096,12 @@ function cutLabels(n, sma, smb, leaf, nMerge) {
   return { lab, nC };
 }
 
+/* Résultat d'une évaluation : mesures en droits et par personne ; « coverage » et « extra » suivent le mode choisi */
+function finishRes(o) {
+  const covR = o.covered / o.T, exR = o.extra / o.T, covP = o.M ? o.covP / o.M : 0, exP = o.M ? o.exP / o.M : 0, byP = ST.ui.weight === 'person';
+  return { k: o.k, nC: o.nC, eff: o.eff, covR, exR, covP, exP, coverage: byP ? covP : covR, extra: byP ? exP : exR,
+    covered: o.covered, extraAbs: o.extra, uncovered: o.total - o.covered, avgMods: o.M ? o.nAssign / o.M : 0, attached: o.attached, good80: o.good80, M: o.M };
+}
 /* Évaluation d'un ensemble de modules (nœuds disjoints de l'arbre) */
 function evaluate(A, nodes, assignThr, minUsers, detail, k) {
   const M = A.M, nSig = A.nSig;
@@ -1087,10 +1124,15 @@ function evaluate(A, nodes, assignThr, minUsers, detail, k) {
   const modUsers = new Int32Array(nC); for (let i = 0; i < aC.length; i++) modUsers[aC[i]]++;
   const keptC = new Uint8Array(nC); let eff = 0;
   for (let c = 0; c < nC; c++) if (modUsers[c] >= minUsers) { keptC[c] = 1; eff++; }
-  let covMod = 0, extraMod = 0, nAssign = 0;
-  for (let i = 0; i < aC.length; i++) { if (!keptC[aC[i]]) continue; covMod += aN[i]; extraMod += modSize[aC[i]] - aN[i]; nAssign++; }
-  const covered = A.coreHeld + covMod, extra = A.coreExtra + extraMod, T = A.total || 1;
-  const res = { k, nC, eff, coverage: covered / T, extra: extra / T, covered, extraAbs: extra, uncovered: A.total - covered, avgMods: M ? nAssign / M : 0 };
+  let covered = 0, extra = 0, nAssign = 0, covP = 0, exP = 0, attached = 0, good80 = 0, ia = 0;
+  for (let m = 0; m < M; m++) {
+    let cov = A.mCore[m], ex = A.nCore - A.mCore[m], nk = 0;
+    while (ia < aM.length && aM[ia] === m) { if (keptC[aC[ia]]) { cov += aN[ia]; ex += modSize[aC[ia]] - aN[ia]; nk++; } ia++; }
+    covered += cov; extra += ex; nAssign += nk;
+    const hm = A.mHeld[m] || 1; covP += cov / hm; exP += cov + ex > 0 ? ex / (cov + ex) : 0;
+    if (nk) attached++; if (cov >= 0.8 * hm - 1e-9) good80++;
+  }
+  const res = finishRes({ k, nC, eff, covered, extra, T: A.total || 1, M, nAssign, covP, exP, attached, good80, total: A.total });
   if (!detail) return res;
 
   const modNum = new Int32Array(nC).fill(-1), kept = [];
@@ -1149,16 +1191,16 @@ function computeCurve(A, assignThr, N) {
   const cohMax = assignThr >= 0.5 - 1e-9 ? HMAX : 1.01;
   const coh = new Uint8Array(nN);
   for (let v = 0; v < nN; v++) coh[v] = v < n || A.smh[v - n] <= cohMax ? 1 : 0;
-  const acc = new Float64Array(nN), fS = new Float64Array(nN), nA = new Int32Array(nN), touched = new Int32Array(nN);
+  const acc = new Float64Array(nN), fS = new Float64Array(nN), nA = new Int32Array(nN), touched = new Int32Array(nN), byP = ST.ui.weight === 'person';
   for (let m = 0; m < A.M; m++) {
-    let t = 0;
+    let t = 0; const wm = byP ? 1 / (A.mHeld[m] || 1) : 1;
     for (let j = A.msPtr[m], e = A.msPtr[m + 1]; j < e; j++) {
       const s = A.msSig[j], w = A.sigW[s]; let v = s;
       while (v >= 0 && coh[v]) { if (acc[v] === 0) touched[t++] = v; acc[v] += w; v = A.parent[v]; }
     }
     for (let x = 0; x < t; x++) {
       const v = touched[x], a = acc[v], sz = A.sizeW[v];
-      if (a >= assignThr * sz - 1e-9) { const ex = sz - a; fS[v] += a - (ex > 1e-9 ? lam * ex : 0); nA[v]++; }
+      if (a >= assignThr * sz - 1e-9) { const ex = sz - a; fS[v] += wm * (a - (ex > 1e-9 ? lam * ex : 0)); nA[v]++; }
       acc[v] = 0;
     }
   }
@@ -1229,7 +1271,7 @@ function elbowK(curve) {
    ================================================================ */
 const MAXAREA = 4000;
 async function analyzeArea(ctx, scopeId, N) {
-  const AR = MODEL.area, scope = scopeId < 0 ? MODEL.all : MODEL.profs[scopeId];
+  const AR = MODEL.area, scope = scopeCSR(scopeId);
   const M = scope.members.length, ptr = scope.ptr, subs = scope.subs, L = subs.length, nA = AR.nA;
   await prog(ctx, 'Préparation des areas…', 0.02);
   const acc = new Int32Array(nA), touched = new Int32Array(nA), touchCnt = new Int32Array(nA);
@@ -1257,12 +1299,17 @@ async function analyzeArea(ctx, scopeId, N) {
   const nC = cand.length, candIdx = new Int32Array(nA).fill(-1);
   cand.forEach((a, i) => { candIdx[a] = i; });
   // droits impossibles à couvrir en areas : abonnement sans area candidate
-  let lostHeld = 0;
-  for (let j = 0; j < L; j++) {
-    const s = subs[j]; let ok = false;
-    for (let x = AR.sPtr[s]; x < AR.sPtr[s + 1]; x++) if (candIdx[AR.sArea[x]] >= 0) { ok = true; break; }
-    if (!ok) lostHeld++;
+  let lostHeld = 0, lostP = 0;
+  for (let m = 0; m < M; m++) {
+    let c = 0;
+    for (let j = ptr[m]; j < ptr[m + 1]; j++) {
+      const s = subs[j]; let ok = false;
+      for (let x = AR.sPtr[s]; x < AR.sPtr[s + 1]; x++) if (candIdx[AR.sArea[x]] >= 0) { ok = true; break; }
+      if (!ok) c++;
+    }
+    lostHeld += c; lostP += c / ((ptr[m + 1] - ptr[m]) || 1);
   }
+  lostP /= M || 1;
   // similarité entre areas : Jaccard pondéré des remplissages (part des abonnements de l'area détenue par chaque personne)
   let tree = { Lc: new Int32Array(0), Rc: new Int32Array(0), smh: new Float64Array(0), leaf: Int32Array.from({ length: nC }, (_, i) => i) };
   if (nC > 1) {
@@ -1291,7 +1338,7 @@ async function analyzeArea(ctx, scopeId, N) {
   const mHeld = new Int32Array(M); for (let m = 0; m < M; m++) mHeld[m] = ptr[m + 1] - ptr[m];
   return {
     kind: 'area', gran: 'area', scopeId, N, M, members: scope.members, ptr, subs, rights: scope.rights, total: L, mHeld,
-    mNoArea, noArea, lostHeld, mfPtr, mfArea, mfCnt, touchCnt, cand, candIdx, nC, nSig: nC, excAreas, cappedAreas,
+    mNoArea, noArea, lostHeld, lostP, mfPtr, mfArea, mfCnt, touchCnt, cand, candIdx, nC, nSig: nC, excAreas, cappedAreas,
     leaf: tree.leaf, nm, Lc: tree.Lc, Rc: tree.Rc, smh: tree.smh, parent, leafCnt, lStart, lEnd
   };
 }
@@ -1323,16 +1370,16 @@ async function computeCurveArea(ctx, A, coreThr, assignThr) {
   }
   C.size = size;
   // valeur de chaque groupe : droits redonnés − λ × droits en trop, sur les personnes qui le recevraient
-  const acc = new Float64Array(nN), fS = new Float64Array(nN), nAss = new Int32Array(nN), touched = new Int32Array(nN);
+  const acc = new Float64Array(nN), fS = new Float64Array(nN), nAss = new Int32Array(nN), touched = new Int32Array(nN), byP = ST.ui.weight === 'person';
   for (let m = 0; m < M; m++) {
-    let t = 0;
+    let t = 0; const wm = byP ? 1 / (A.mHeld[m] || 1) : 1;
     for (let j = A.ptr[m]; j < A.ptr[m + 1]; j++) {
       const s = A.subs[j]; if (coreAbo[s]) continue; gid++;
       for (let y = AR.sPtr[s]; y < AR.sPtr[s + 1]; y++) { let v = A.candIdx[AR.sArea[y]]; while (v >= 0 && coh[v] && stampN[v] !== gid) { stampN[v] = gid; if (acc[v] === 0) touched[t++] = v; acc[v]++; v = A.parent[v]; } }
     }
     for (let x = 0; x < t; x++) {
       const v = touched[x], a = acc[v], sz = size[v];
-      if (sz > 0 && a >= assignThr * sz - 1e-9) { const ex = sz - a; fS[v] += a - (ex > 1e-9 ? lam * ex : 0); nAss[v]++; }
+      if (sz > 0 && a >= assignThr * sz - 1e-9) { const ex = sz - a; fS[v] += wm * (a - (ex > 1e-9 ? lam * ex : 0)); nAss[v]++; }
       acc[v] = 0;
     }
     if ((m & 1023) === 0) await prog(ctx, 'Choix des modules…', 0.5 + 0.1 * m / M);
@@ -1396,7 +1443,7 @@ function evaluateArea(A, C, nodes, detail, k) {
     return (bits[c] = b);
   };
   const mCov = detail ? new Float64Array(M) : null, mExtra = detail ? new Float64Array(M) : null;
-  let covered = 0, extra = 0, nAssign = 0, i = 0;
+  let covered = 0, extra = 0, nAssign = 0, i = 0, covP = 0, exP = 0, attached = 0, good80 = 0;
   const mmPtr = detail ? new Int32Array(M + 1) : null, mmMod = [], mmCnt = [];
   for (let m = 0; m < M; m++) {
     let cov = C.mCoreHeld[m], ex = C.coreSize - C.mCoreHeld[m];
@@ -1419,9 +1466,11 @@ function evaluateArea(A, C, nodes, detail, k) {
       cov += cm; ex += us - cm;
     }
     nAssign += list.length; covered += cov; extra += ex;
+    const hm = A.mHeld[m] || 1; covP += cov / hm; exP += cov + ex > 0 ? ex / (cov + ex) : 0;
+    if (list.length) attached++; if (cov >= 0.8 * hm - 1e-9) good80++;
     if (detail) { mCov[m] = cov; mExtra[m] = ex; mmPtr[m + 1] = mmPtr[m] + list.length; for (const q of list) { mmMod.push(aC[q]); mmCnt.push(aN[q]); } }
   }
-  const res = { k, nC: nCm, eff, coverage: covered / T, extra: extra / T, covered, extraAbs: extra, uncovered: A.total - covered, avgMods: M ? nAssign / M : 0 };
+  const res = finishRes({ k, nC: nCm, eff, covered, extra, T, M, nAssign, covP, exP, attached, good80, total: A.total });
   if (!detail) return res;
   // renumérotation des modules retenus (ordre de l'arbre)
   const modNum = new Int32Array(nCm).fill(-1), kept = [];
@@ -1574,7 +1623,7 @@ async function onFile(file) {
   showError('');
   if (runCtx) runCtx.cancelled = true;
   busy.hide();
-  ST.file = file; ST.raw = null; MODEL = null; HEAVY.clear(); PROFC.clear(); CMPC.clear();
+  ST.file = file; ST.raw = null; MODEL = null; HEAVY.clear(); PROFC.clear(); CMPC.clear(); SCOPEC.clear(); SIZEQ.clear();
   Object.assign(SC, { key: null, A: null, curveKey: null, curve: null, E: null }); PR.key = null;
   Object.assign(ST.ui, { scope: null, k: 0, kManual: false, hideExc: null, search: '' });
   $('#tabs').hidden = true; $('#shared').hidden = true;
@@ -1635,7 +1684,7 @@ async function rebuild() {
   } catch (e) { if (e === CANCEL) return; throw e; }
   finally { busy.hide(); }
   ST.buildMs = now() - t0;
-  HEAVY.clear(); PROFC.clear(); CMPC.clear();
+  HEAVY.clear(); PROFC.clear(); CMPC.clear(); SCOPEC.clear(); SIZEQ.clear();
   Object.assign(SC, { key: null, A: null, curveKey: null, curve: null, E: null }); PR.key = null;
   if (ST.ui.scope == null || ST.ui.scope >= MODEL.nP) ST.ui.scope = MODEL.profInfo.slice().sort((a, b) => b.M - a.M)[0]?.p ?? -1;
   if (ST.ui.gran === 'area' && !MODEL.area) ST.ui.gran = 'sub';
@@ -1774,6 +1823,14 @@ function rerunTab() { if (ST.ui.tab === 'profiles') runProfiles(); else if (ST.u
 /* ================================================================
    Onglet 1 : vue d'ensemble
    ================================================================ */
+function metricTiles(E) {
+  const byP = ST.ui.weight === 'person';
+  return [
+    tile('Personnes rattachées', pct(E.attached / (E.M || 1)), 'à au moins un module · ' + pct(E.good80 / (E.M || 1)) + ' couvertes à 80\u202f% ou plus'),
+    tile('Couverture', pct(E.coverage), byP ? 'moyenne par personne · ' + pct(E.covR) + ' en droits' : 'des droits actuels · ' + pct(E.covP) + ' par personne'),
+    tile('Droits en trop', pct(E.extra), byP ? 'part moyenne de ce que reçoit une personne · ' + fmt(E.extraAbs) + ' droits' : fmt(E.extraAbs) + ' ' + agree(E.extraAbs, 'droit ajouté', 'droits ajoutés'))
+  ];
+}
 function tile(l, v, d) { return h('div', { class: 'tile' }, h('div', { class: 'l' }, l), h('div', { class: 'v' }, v), d ? h('div', { class: 'd' }, d) : null); }
 
 function areaOverviewCard() {
@@ -1948,7 +2005,7 @@ function renderProfiles() {
   for (const x of rows) {
     const q = R.bestQ[x.p];
     tb.append(h('tr', null,
-      h('td', null, h('button', { class: 'linkbtn', type: 'button', title: 'Analyser ce profil', onclick: () => { ST.ui.scope = x.p; ST.ui.kManual = false; ST.ui.minUsers = null; setTab('scope'); } }, MODEL.P[x.p])),
+      h('td', null, h('button', { class: 'linkbtn', type: 'button', title: 'Analyser ce profil', onclick: () => { ST.ui.scope = x.p; ST.ui.kManual = false; ST.ui.minUsers = null; ST.ui.maxHeld = null; setTab('scope'); } }, MODEL.P[x.p])),
       h('td', null, gname.get(x.p) || '—'),
       h('td', { class: 'n' }, fmt(x.M)), h('td', { class: 'n' }, fmt(x.distinct)), h('td', { class: 'n' }, fmt(x.core)),
       h('td', { class: 'n' }, x.M >= 2 ? pct(x.homo) : '—'),
@@ -2032,7 +2089,7 @@ async function runScope() {
       const A = await getHeavy(ctx, ui.gran, N);
       SC.key = key; SC.A = A; SC.curveKey = null; ui.kManual = false; ui.hideExc = null;
     }
-    const A = SC.A, ck = key + '|' + ui.assignThr + '|' + ui.coreThr;
+    const A = SC.A, ck = key + '|' + ui.assignThr + '|' + ui.coreThr + '|' + ui.weight;
     if (SC.curveKey !== ck) {
       await prog(ctx, 'Choix des modules…', 0.98);
       const r = await getCurve(ctx, A, ck, N);
@@ -2054,7 +2111,7 @@ async function runScope() {
 }
 
 const CMPC = new Map();   // courbes calculées, par périmètre et réglages
-function heavyKey(gran, N) { const ui = ST.ui; return gran === 'area' ? 'area|' + ui.scope + '|' + N : ui.scope + '|' + gran + '|' + ui.coreThr + '|' + N; }
+function heavyKey(gran, N) { const ui = ST.ui, x = '|x' + (ui.maxHeld || 0); return gran === 'area' ? 'area|' + ui.scope + '|' + N + x : ui.scope + '|' + gran + '|' + ui.coreThr + '|' + N + x; }
 async function getHeavy(ctx, gran, N) {
   const key = heavyKey(gran, N); let A = HEAVY.get(key);
   if (!A) {
@@ -2077,7 +2134,7 @@ async function getCurve(ctx, A, ck, N) {
 async function compareBoth(ctx, N) {
   const ui = ST.ui, out = {};
   for (const g of ['sub', 'area']) {
-    const A = await getHeavy(ctx, g, N), ck = heavyKey(g, N) + '|' + ui.assignThr + '|' + ui.coreThr;
+    const A = await getHeavy(ctx, g, N), ck = heavyKey(g, N) + '|' + ui.assignThr + '|' + ui.coreThr + '|' + ui.weight;
     if (!CMPC.has(ck)) await prog(ctx, 'Comparaison abonnements / areas…', 0.99);
     const r = await getCurve(ctx, A, ck, N);
     const sug = suggestK(r.pts, ui.tCov, ui.tExtra), k = sug >= 0 ? sug : fallbackK(r.pts, ui.tCov, ui.tExtra, ui.assignThr < 0.5 - 1e-9);
@@ -2098,7 +2155,7 @@ function renderScopeFilters(pending) {
 function renderScopeFiltersInner(pending) {
   const ui = ST.ui, f = $('#scope-filters'); f.textContent = '';
   const opts = MODEL.profInfo.slice().sort((a, b) => b.M - a.M);
-  const sel = h('select', { 'aria-label': 'Profil analysé', onchange: e => { ui.scope = +e.target.value; ui.kManual = false; ui.minUsers = null; runScope(); } },
+  const sel = h('select', { 'aria-label': 'Profil analysé', onchange: e => { ui.scope = +e.target.value; ui.kManual = false; ui.minUsers = null; ui.maxHeld = null; runScope(); } },
     h('option', { value: -1, selected: ui.scope === -1 ? true : null }, 'Tous les profils (' + fmt(MODEL.ov.users) + ' pers.)'),
     opts.map(x => h('option', { value: x.p, selected: ui.scope === x.p ? true : null }, MODEL.P[x.p] + ' (' + fmt(x.M) + ' pers.)')));
   f.append(h('div', { class: 'ctl' }, h('span', { class: 'lab' }, 'Profil analysé'), sel));
@@ -2107,6 +2164,19 @@ function renderScopeFiltersInner(pending) {
     h('div', { class: 'seg', role: 'group', 'aria-label': 'Priorité' },
       PRESETS.map((p, i) => h('button', { type: 'button', 'aria-pressed': String(i === cur), title: presetTitle(p),
         onclick: () => { if (i !== cur) applyPreset(p); } }, p.label)))));
+  f.append(segCtl('Compter', [['person', 'Chaque personne'], ['right', 'Chaque droit']], ui.weight, v => { ui.weight = v; ui.kManual = false; runScope(); }));
+  const zs = sizeStats(ui.scope);
+  const mxIn = h('input', { type: 'number', min: 1, step: 1, value: ui.maxHeld ?? '', placeholder: 'aucune limite', style: 'width:112px', 'aria-label': 'Exclure les personnes au-delà de ce nombre d\u2019abonnements' });
+  mxIn.addEventListener('change', () => {
+    if (RENDERING || !mxIn.isConnected) return;
+    const t = String(mxIn.value).trim(), v = t === '' ? null : Math.max(1, Math.round(+t || 0));
+    ui.maxHeld = v; ui.kManual = false; ui.minUsers = null; runScope();
+  });
+  f.append(h('div', { class: 'ctl' }, h('span', { class: 'lab' }, 'Périmètres très larges : exclure au-delà de'),
+    h('div', { class: 'row' }, mxIn, h('span', { class: 'small muted' }, 'abonnements'),
+      ui.maxHeld ? h('button', { class: 'btn sm', type: 'button', onclick: () => { ui.maxHeld = null; ui.kManual = false; ui.minUsers = null; runScope(); } }, 'Tout inclure')
+        : h('button', { class: 'btn sm', type: 'button', title: '90 % des personnes ont au plus ' + fmt(zs.p90) + ' abonnements', onclick: () => { ui.maxHeld = Math.max(1, zs.p90); ui.kManual = false; ui.minUsers = null; runScope(); } }, 'Exclure les 10 % plus larges')),
+    h('span', { class: 'small muted' }, 'médiane ' + fmt(zs.med) + ' · 90 % au plus ' + fmt(zs.p90) + ' · max ' + fmt(zs.max))));
   const N = effMinUsers();
   const nIn = h('input', { type: 'number', min: 2, max: 100000, step: 1, value: N, 'aria-label': 'Taille minimale d’un module' });
   nIn.addEventListener('change', () => { if (RENDERING || !nIn.isConnected) return; const v = clamp(Math.round(+nIn.value || 2), 2, 100000); nIn.value = v; ui.minUsers = v === autoMinUsers(ui.scope) && ui.minUsers == null ? null : v; runScope(); });
@@ -2159,8 +2229,7 @@ function renderScopeResults() {
     tile(A.gran === 'sub' ? 'Abonnements' : 'Abonnements × droits', fmt(A.nI), fmt(T) + ' droits actuels'),
     tile('Noyau', fmt(A.nCore), 'attribué à tout le profil'),
     tile('Modules retenus', fmt(E.eff), E.eff ? fmt1(E.avgMods) + ' par personne en moyenne' : null),
-    tile('Couverture', pct(E.coverage), 'des droits actuels redonnés'),
-    tile('Droits en trop', pct(E.extra), fmt(E.extraAbs) + ' ' + agree(E.extraAbs, 'droit ajouté', 'droits ajoutés')),
+    ...metricTiles(E),
     tile('Non couverts', fmt(E.uncovered), 'à demander individuellement')
   ));
 
@@ -2219,7 +2288,8 @@ function renderScopeResults() {
       h('dt', null, 'Module'), h('dd', null, 'Groupe d’abonnements souvent détenus ensemble. Une personne le reçoit si elle en détient déjà au moins ' + pct(ui.assignThr) + '. Un module doit concerner au moins ' + plural(A.N, 'personne', 'personnes') + '. Une personne peut cumuler plusieurs modules. Pour chaque nombre de modules, l’outil retient les groupes qui redonnent le plus de droits pour le moins de droits en trop.'),
       h('dt', null, 'Exception'), h('dd', null, 'Abonnement détenu par moins de ' + plural(A.N, 'personne', 'personnes') + ' (la taille minimale d’un module) : il ne peut pas justifier un profil et reste en demande individuelle.'),
       h('dt', null, 'Hors module'), h('dd', null, 'Abonnements assez partagés, mais qui ne forment aucun module retenu : demandes individuelles, ou module supplémentaire si vous augmentez leur nombre.'),
-      h('dt', null, 'Couverture'), h('dd', null, 'Part des droits actuels (couples personne × abonnement) que le noyau et les modules redonnent.'),
+      h('dt', null, 'Compter'), h('dd', null, '« Chaque personne » : la couverture est la moyenne, sur les personnes, de la part de leur périmètre que le profil redonne, et le choix des modules donne le même poids à chacune. « Chaque droit » : chaque couple personne × abonnement pèse autant, donc les périmètres très larges dominent.'),
+      h('dt', null, 'Couverture'), h('dd', null, 'En « Chaque droit » : part des droits actuels (couples personne × abonnement) que le noyau et les modules redonnent. En « Chaque personne » : moyenne par personne.'),
       h('dt', null, 'Droits en trop'), h('dd', null, 'Droits que le noyau et les modules donneraient en plus de l’existant, rapportés aux droits actuels.'),
       h('dt', null, 'Limite'), h('dd', null, 'L’analyse part des droits attribués aujourd’hui, pas de l’usage : un droit attribué mais jamais utilisé reste dans la proposition. À croiser avec les logs @pbl si vous les avez.'))));
 }
@@ -2235,8 +2305,7 @@ function renderScopeResultsArea() {
     tile('Areas touchées', fmt(A.nC + A.excAreas.length + A.cappedAreas.length), fmt(T) + ' droits actuels'),
     tile('Noyau', plural(C.coreAreas.length, 'area', 'areas'), plural(C.coreSize, 'abonnement', 'abonnements') + ', pour tout le profil'),
     tile('Modules retenus', fmt(E.eff), E.eff ? plural(nModAreas, 'area', 'areas') + ' · ' + fmt1(E.avgMods) + ' par personne' : null),
-    tile('Couverture', pct(E.coverage), 'des droits actuels redonnés'),
-    tile('Droits en trop', pct(E.extra), fmt(E.extraAbs) + ' ' + agree(E.extraAbs, 'droit ajouté', 'droits ajoutés')),
+    ...metricTiles(E),
     tile('Non couverts', fmt(E.uncovered), A.noArea ? 'dont ' + fmt(A.noArea) + ' sans area' : 'à demander individuellement')
   ));
   curveCard(host);
@@ -2276,7 +2345,7 @@ function renderScopeResultsArea() {
       h('dt', null, 'Remplissage'), h('dd', null, 'Part des abonnements d’une area qu’une personne détient aujourd’hui. Une area donnée apporte tous ses abonnements : le reste devient des droits en trop.'),
       h('dt', null, 'Noyau'), h('dd', null, 'Areas remplies à au moins ' + pct(ui.assignThr) + ' par au moins ' + pct(ui.coreThr) + ' des membres. Données à tout le profil.'),
       h('dt', null, 'Module'), h('dd', null, 'Groupe d’areas souvent détenues ensemble. Une personne le reçoit si elle détient déjà au moins ' + pct(ui.assignThr) + ' de ses abonnements (hors noyau). Un module doit concerner au moins ' + plural(A.N, 'personne', 'personnes') + '.'),
-      h('dt', null, 'Mesure'), h('dd', null, 'Couverture et droits en trop sont comptés en abonnements. Un abonnement présent dans plusieurs areas n’est compté qu’une fois.'),
+      h('dt', null, 'Mesure'), h('dd', null, 'Couverture et droits en trop sont comptés en abonnements, par personne ou au total selon « Compter ». Un abonnement présent dans plusieurs areas n’est compté qu’une fois.'),
       h('dt', null, 'Sans area'), h('dd', null, 'Abonnements rattachés à aucune area : un profil en areas ne peut pas les redonner, ils restent en demandes individuelles.'),
       h('dt', null, 'Exceptions'), h('dd', null, 'Areas touchées par moins de ' + plural(A.N, 'personne', 'personnes') + ' : elles ne peuvent pas justifier un module.'))));
 }
@@ -2456,8 +2525,8 @@ function curveCard(host) {
   cc.append(h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Couverture selon le nombre de modules'),
     h('p', { class: 'desc' }, 'Chaque module ajouté redonne des droits actuels (couverture) mais peut en donner à des personnes qui ne les ont pas (droits en trop). Cliquez sur la courbe pour choisir un nombre de modules.'))));
   cc.append(h('div', { class: 'legend' },
-    h('span', null, h('span', { class: 'ln', style: 'background:' + P.s1 }), 'Couverture des droits actuels'),
-    h('span', null, h('span', { class: 'ln', style: 'background:' + P.s2 }), 'Droits en trop'),
+    h('span', null, h('span', { class: 'ln', style: 'background:' + P.s1 }), ui.weight === 'person' ? 'Couverture moyenne par personne' : 'Couverture des droits actuels'),
+    h('span', null, h('span', { class: 'ln', style: 'background:' + P.s2 }), ui.weight === 'person' ? 'Part de droits en trop par personne' : 'Droits en trop'),
     h('span', null, h('span', { class: 'ln', style: 'background:' + P.ink2 + ';width:2px;height:12px' }), 'Découpage affiché')));
   const ch = h('div', { class: 'chart' }); cc.append(ch);
   cc.append(curveTable(SC.curve));
@@ -2497,6 +2566,11 @@ function segCtlInline(label, options, value, onPick, disabled) {
       options.map(([v, l]) => h('button', { type: 'button', 'aria-pressed': String(!disabled && v === value), disabled: disabled ? true : null, title: disabled ? 'Indisponible quand la matrice est agrégée' : null, onclick: () => { if (v !== value) onPick(v); } }, l))));
 }
 
+function covPhrase(c) {
+  return ST.ui.weight === 'person'
+    ? 'couvrir en moyenne ' + pct(c.coverage) + ' du périmètre de chaque personne, avec ' + pct(c.extra) + ' de droits en trop dans ce qu\u2019elle reçoit'
+    : 'redonner ' + pct(c.coverage) + ' des droits actuels avec ' + pct(c.extra) + ' de droits en trop';
+}
 function lectureScope(A, E) {
   const ui = ST.ui, box = h('div', { class: 'lecture' }), T = A.total || 1, M = A.M;
   if (M < 5) box.append(h('p', null, h('strong', null, plural(M, 'personne', 'personnes') + ' seulement'), ' dans ce périmètre : un regroupement statistique n’a pas de sens, mieux vaut définir le profil à la main.'));
@@ -2516,11 +2590,11 @@ function lectureScope(A, E) {
   let verdict;
   if (A.nSig === 0) verdict = '→ Un seul périmètre suffit : le noyau, plus des demandes individuelles pour le reste.';
   else if (cS && sug === 0) verdict = '→ Le noyau seul atteint déjà les objectifs (couverture ' + pct(cS.coverage) + ', droits en trop ' + pct(cS.extra) + ') : un seul périmètre.';
-  else if (cS && (A.scopeId < 0 || cS.eff <= Math.max(3, Math.ceil(M / 8)))) verdict = '→ ' + plural(cS.eff, 'module suffit', 'modules suffisent') + ' pour redonner ' + pct(cS.coverage) + ' des droits actuels avec ' + pct(cS.extra) + ' de droits en trop.';
+  else if (cS && (A.scopeId < 0 || cS.eff <= Math.max(3, Math.ceil(M / 8)))) verdict = '→ ' + plural(cS.eff, 'module suffit', 'modules suffisent') + ' pour ' + covPhrase(cS) + '.';
   else if (cS) verdict = '→ Il faut ' + plural(cS.eff, 'module', 'modules') + ' pour ' + plural(M, 'personne', 'personnes') + ' : le périmètre est en grande partie individuel. Un référentiel de couverture (portefeuille par personne) sera plus simple à maintenir que des profils.';
   else {
     const fb = SC.curve[SC.fb], best = Math.max(...SC.curve.map(c => c.coverage));
-    const lost = A.lostHeld / T, covFirst = ui.assignThr < 0.5 - 1e-9;
+    const lost = ui.weight === 'person' ? A.lostP : A.lostHeld / T, covFirst = ui.assignThr < 0.5 - 1e-9;
     if (best < ui.tCov - 5e-4) {
       verdict = '→ La couverture plafonne à ' + pct(best, 1) + ', sous l’objectif de ' + pct(ui.tCov) + '. Découpage affiché : ' + plural(fb.eff, 'module', 'modules') + ', ' + pct(fb.coverage, 1) + ' de couverture, ' + pct(fb.extra) + ' de droits en trop. ' +
         (lost >= 1 - ui.tCov - 1e-9
@@ -2534,8 +2608,16 @@ function lectureScope(A, E) {
       'Passez en priorité « Couverture » pour accepter plus de droits en trop, ou gardez l’équilibre et traitez le reste en demandes individuelles.';
   }
   box.append(h('p', { class: 'verdict' }, verdict));
-  if (E.extra >= 0.25) box.append(h('p', null, h('strong', null, 'À noter : '),
-    'ce découpage donne ' + fmt(E.extraAbs) + ' droits en trop, soit ' + pct(E.extra) + ' des droits actuels. Sur le périmètre, chaque droit en trop ouvre l’accès aux données d’un client que la personne ne suit pas aujourd’hui : à valider avec la Compliance et les responsables des clients.'));
+  const hasCore = A.kind === 'area' ? SC.C.coreAreas.length > 0 : A.nCore > 0;
+  box.append(h('p', null, h('strong', null, pct(E.attached / (M || 1)) + ' des personnes'), ' ont au moins un module' + (hasCore ? ' en plus du noyau' : '') + ', ' + pct(E.good80 / (M || 1)) + ' sont couvertes à 80\u202f% ou plus de leur périmètre' + (hasCore || E.attached ? '.' : ' : sans noyau ni module, les autres restent en demandes individuelles.')));
+  const zs = sizeStats(A.scopeId), exl = scopeCSR(A.scopeId).excluded;
+  if (exl) box.append(h('p', null, h('strong', null, plural(exl.n, 'personne exclue', 'personnes exclues')), ' (plus de ' + fmt(ui.maxHeld) + ' abonnements) : ' + agree(exl.n, 'elle détient', 'elles détiennent') + ' ' + pct(exl.couples / (exl.total || 1)) + ' des droits du périmètre. Prévoyez pour ' + agree(exl.n, 'elle', 'elles') + ' un profil « accès large » ou traitez-' + agree(exl.n, 'la', 'les') + ' à part.'));
+  if (E.covR - E.covP > 0.15) box.append(h('p', null, h('strong', null, 'Couverture concentrée : '),
+    'en droits, le découpage redonne ' + pct(E.covR) + ' de l\u2019existant, mais une personne n\u2019est couverte qu\u2019à ' + pct(E.covP) + ' en moyenne : la couverture en droits est tirée par les périmètres les plus larges.' +
+    (!exl && zs.top10 >= 0.4 ? ' Les 10\u202f% de personnes aux plus grands périmètres détiennent ' + pct(zs.top10) + ' des droits : mettez-les de côté avec « Périmètres très larges » pour analyser le reste.' : '')));
+  else if (!exl && zs.top10 >= 0.5) box.append(h('p', null, 'Les 10\u202f% de personnes aux plus grands périmètres détiennent ' + pct(zs.top10) + ' des droits. Pour les analyser à part, utilisez « Périmètres très larges ».'));
+  if (E.exR >= 0.25) box.append(h('p', null, h('strong', null, 'À noter : '),
+    'ce découpage donne ' + fmt(E.extraAbs) + ' droits en trop, soit ' + pct(E.exR) + ' des droits actuels. Sur le périmètre, chaque droit en trop ouvre l’accès aux données d’un client que la personne ne suit pas aujourd’hui : à valider avec la Compliance et les responsables des clients.'));
   if (A.scopeId < 0 && Number.isFinite(E.purity)) {
     box.append(h('p', null, E.purity >= 0.8
       ? 'Les modules recoupent bien les profils MyIAM actuels : en moyenne ' + pct(E.purity) + ' des personnes d’un module viennent du même profil.'
