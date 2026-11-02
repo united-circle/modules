@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Périmètres @pbl</title>
+<title>Périmètres NeoLink</title>
 <style>
 :root{
   color-scheme: light;
@@ -175,7 +175,7 @@ table.tbl{border-collapse:collapse;width:100%;font-size:13px}
 <div class="wrap">
   <header class="top">
     <div>
-      <h1>Périmètres @pbl</h1>
+      <h1>Périmètres NeoLink</h1>
       <p class="sub">Profils MyIAM × abonnements : noyau commun, modules et exceptions</p>
     </div>
     <span class="offline"><span class="dot" aria-hidden="true"></span>Hors ligne · les données restent sur ce poste</span>
@@ -688,9 +688,9 @@ function makeConsumer(raw, map, stats) {
     const uv = f[iu], sv0 = f[is];
     const u = uv == null ? '' : String(uv).trim();
     const s = sv0 == null ? '' : String(sv0).trim();
-    if (!u || !s) { stats.skipped++; if (!u) stats.noUser++; else { stats.noSub++; U.id(u); } return; }
     const pv = f[ip];
     const p = (pv == null ? '' : String(pv).trim()) || '(sans profil)';
+    if (!u || !s) { stats.skipped++; if (!u) stats.noUser++; else { stats.noSub++; raw.noSub.push(U.id(u), P.id(p)); } return; }
     const r = (ii >= 0 ? yn(f[ii]) : 0) | (iv >= 0 ? yn(f[iv]) << 1 : 0) | (isd >= 0 ? yn(f[isd]) << 2 : 0);
     st.push(P.id(p), U.id(u), S.id(s), r);
   };
@@ -767,7 +767,7 @@ function quantiles(arr) {
 /* Areas : correspondances abonnement ↔ area et utilisateur ↔ area, rapportées aux identifiants de l'extraction */
 function prepareAreas(raw) {
   const sa = ST.aux.subArea.data, ua = ST.aux.userArea.data;
-  raw.S.truncate(raw.nS0);   // oublie les abonnements ajoutés par un fichier areas précédent
+  raw.S.truncate(raw.nS0); raw.U.truncate(raw.nU0); raw.P.truncate(raw.nP0);   // oublie ce qu'un fichier areas précédent avait ajouté
   if (!sa) return null;
   const nS0 = raw.S.names.length, AI = new Interner();
   const subG = new Int32Array(sa.left.names.length);
@@ -778,8 +778,9 @@ function prepareAreas(raw) {
   if (ua) {
     uaA = new Int32Array(ua.area.names.length);
     for (let i = 0; i < uaA.length; i++) uaA[i] = AI.id(ua.area.names[i]);
+    // personnes absentes de l'extraction (accès uniquement par area) : ajoutées, sous un profil à part
     uaU = new Int32Array(ua.left.names.length);
-    for (let i = 0; i < uaU.length; i++) { const id = raw.U.map.get(ua.left.names[i]); uaU[i] = id === undefined ? -1 : id; }
+    for (let i = 0; i < uaU.length; i++) uaU[i] = raw.U.id(ua.left.names[i]);
   }
   const nS = raw.S.names.length, nA = AI.names.length, nU = raw.U.names.length;
   const P = sa.pairs, keys = new Float64Array(P.n);
@@ -795,11 +796,12 @@ function prepareAreas(raw) {
   for (let s = 0; s < nS; s++) for (let x = sPtr[s]; x < sPtr[s + 1]; x++) aSub[aFill[sArea[x]]++] = s;
   let mapped0 = 0, mappedAll = 0, multi = 0;
   for (let s = 0; s < nS; s++) { const c = sPtr[s + 1] - sPtr[s]; if (c) { mappedAll++; if (c >= 2) multi++; if (s < nS0) mapped0++; } }
-  let uPtr = null, uArea = null, unknownUsers = 0;
+  let uPtr = null, uArea = null, unknownUsers = 0, pseudoP = -1;
   if (ua) {
-    const Q = ua.pairs, k2 = new Float64Array(Q.n), unk = new Uint8Array(ua.left.names.length); let cnt = 0;
-    for (let i = 0; i < Q.n; i++) { const u = uaU[Q.a[i]]; if (u < 0) { unk[Q.a[i]] = 1; continue; } k2[cnt++] = u * nA + uaA[Q.b[i]]; }
-    for (const x of unk) unknownUsers += x;
+    const Q = ua.pairs, k2 = new Float64Array(Q.n); let cnt = 0;
+    for (let i = 0; i < Q.n; i++) k2[cnt++] = uaU[Q.a[i]] * nA + uaA[Q.b[i]];
+    for (let u = raw.nU0; u < nU; u++) unknownUsers++;
+    if (unknownUsers) pseudoP = raw.P.id('(sans profil MyIAM · accès par area)');
     const kk = k2.subarray(0, cnt).sort();
     uPtr = new Int32Array(nU + 1); const tmp = new Int32Array(cnt); let n2 = 0;
     for (let i = 0; i < cnt; i++) if (i === 0 || kk[i] !== kk[i - 1]) { const u = Math.floor(kk[i] / nA); tmp[n2++] = kk[i] - u * nA; uPtr[u + 1]++; }
@@ -807,7 +809,7 @@ function prepareAreas(raw) {
     uArea = tmp.slice(0, n2);
   }
   return { nA, names: AI.names, size, sPtr, sArea, aPtr, aSub, nS0, mapped0, mappedAll, multi,
-           uPtr, uArea, unknownUsers, uaUsers: ua ? ua.left.names.length : 0 };
+           uPtr, uArea, unknownUsers, pseudoP, nU0: raw.nU0, uaUsers: ua ? ua.left.names.length : 0 };
 }
 
 /* Mode d'attribution actuel : droits expliqués par une area attribuée, abonnements des areas absents de l'extraction */
@@ -819,14 +821,16 @@ async function areaDiagnostics(ctx, AR, all0, st, keepRow, upPtr, upList, nP, nS
   const uPtr = AR.uPtr, uArea = AR.uArea;
   const stampH = new Int32Array(nS).fill(-1), stampG = new Int32Array(nS).fill(-1), extra = new Grow64();
   const effP = new Float64Array(nP), viaP = new Float64Array(nP);
-  let given = 0, present = 0, effTot = 0, viaTot = 0, usersWithAreaInExtract = 0;
-  const M0 = all0.members.length;
-  for (let m = 0; m < M0; m++) {
-    const u = all0.members[m], held = all0.ptr[m + 1] - all0.ptr[m];
+  let given = 0, present = 0, effTot = 0, viaTot = 0, usersWithAreaInExtract = 0, areaOnly = 0;
+  const nU = uPtr.length - 1, memIdx = new Int32Array(nU).fill(-1);
+  all0.members.forEach((u, m) => { memIdx[u] = m; });
+  for (let u = 0; u < nU; u++) {
+    const m = memIdx[u], held = m >= 0 ? all0.ptr[m + 1] - all0.ptr[m] : 0;
+    if (m < 0 && uPtr[u + 1] === uPtr[u]) continue;
     let g = 0, pr = 0;
     if (uPtr[u + 1] > uPtr[u]) {
-      usersWithAreaInExtract++;
-      for (let j = all0.ptr[m]; j < all0.ptr[m + 1]; j++) stampH[all0.subs[j]] = u;
+      usersWithAreaInExtract++; if (m < 0) areaOnly++;
+      if (m >= 0) for (let j = all0.ptr[m]; j < all0.ptr[m + 1]; j++) stampH[all0.subs[j]] = u;
       for (let x = uPtr[u]; x < uPtr[u + 1]; x++) {
         const a = uArea[x];
         for (let y = AR.aPtr[a]; y < AR.aPtr[a + 1]; y++) {
@@ -838,7 +842,7 @@ async function areaDiagnostics(ctx, AR, all0, st, keepRow, upPtr, upList, nP, nS
     given += g; present += pr;
     const eff = held + g - pr; effTot += eff; viaTot += g;
     for (let x = upPtr[u]; x < upPtr[u + 1]; x++) { effP[upList[x]] += eff; viaP[upList[x]] += g; }
-    if ((m & 1023) === 0) await prog(ctx, 'Analyse des areas…', 0.3 + 0.2 * m / M0);
+    if ((u & 1023) === 0) await prog(ctx, 'Analyse des areas…', 0.3 + 0.2 * u / nU);
   }
   let extraP = null, extraAll = null;
   if (via && extra.n) {
@@ -847,7 +851,7 @@ async function areaDiagnostics(ctx, AR, all0, st, keepRow, upPtr, upList, nP, nS
     extraP = Array.from({ length: nP }, (_, p) => new Float64Array(cntP[p])); const fillP = new Int32Array(nP);
     for (let i = 0; i < extra.n; i++) { const us = extra.a[i], u = Math.floor(us / nS); for (let x = upPtr[u]; x < upPtr[u + 1]; x++) { const p = upList[x]; extraP[p][fillP[p]++] = us * 8; } }
   }
-  Object.assign(diag, { given, present, effTot, viaTot, effP, viaP, usersWithAreaInExtract });
+  Object.assign(diag, { given, present, effTot, viaTot, effP, viaP, usersWithAreaInExtract, areaOnly });
   return { diag, extraP, extraAll };
 }
 
@@ -864,11 +868,14 @@ async function buildModel(ctx) {
   for (let i = 0; i < n; i++) { if (!keepRow(i)) continue; perm[fill[st.p[i]]++] = i; }
 
   // utilisateur → profils
-  const upKeys = new Float64Array(kept); let q = 0;
+  const ns = raw.noSub.n, nNew = AR && AR.pseudoP >= 0 ? nU - raw.nU0 : 0, nUp = kept + ns + nNew;
+  const upKeys = new Float64Array(nUp); let q = 0;
   for (let i = 0; i < n; i++) { if (!keepRow(i)) continue; upKeys[q++] = st.u[i] * nP + st.p[i]; }
+  for (let i = 0; i < ns; i++) upKeys[q++] = raw.noSub.a[i] * nP + raw.noSub.b[i];
+  for (let u = raw.nU0; u < raw.nU0 + nNew; u++) upKeys[q++] = u * nP + AR.pseudoP;
   upKeys.sort();
-  const upPtr = new Int32Array(nU + 1), upTmp = new Int32Array(kept); let nup = 0;
-  for (let i = 0; i < kept; i++) if (i === 0 || upKeys[i] !== upKeys[i - 1]) { const u = Math.floor(upKeys[i] / nP); upTmp[nup++] = upKeys[i] - u * nP; upPtr[u + 1]++; }
+  const upPtr = new Int32Array(nU + 1), upTmp = new Int32Array(nUp); let nup = 0;
+  for (let i = 0; i < nUp; i++) if (i === 0 || upKeys[i] !== upKeys[i - 1]) { const u = Math.floor(upKeys[i] / nP); upTmp[nup++] = upKeys[i] - u * nP; upPtr[u + 1]++; }
   for (let u = 0; u < nU; u++) upPtr[u + 1] += upPtr[u];
   const upList = upTmp.slice(0, nup);
   await prog(ctx, 'Préparation des données…', 0.1);
@@ -918,7 +925,13 @@ async function buildModel(ctx) {
   const upsNZ = []; for (let s = 0; s < nS; s++) if (ups[s] > 0) upsNZ.push(ups[s]);
   let multi = 0; for (let u = 0; u < nU; u++) if (upPtr[u + 1] - upPtr[u] >= 2) multi++;
   const storedU = new Uint8Array(nU); for (let i = 0; i < n; i++) storedU[st.u[i]] = 1;
-  let usersStored = 0; for (let u = 0; u < nU; u++) usersStored += storedU[u];
+  const inAll = new Uint8Array(nU); for (const u of all.members) inAll[u] = 1;
+  let usersStored = 0, noRights = 0, noSubArea = 0, noSubAreaIn = 0, areaOnlyNew = 0, areaOnlyNewIn = 0;
+  for (let u = 0; u < raw.nU0; u++) {
+    if (storedU[u]) { usersStored++; if (!inAll[u]) noRights++; }
+    else if (AR && AR.uPtr && AR.uPtr[u + 1] > AR.uPtr[u]) { noSubArea++; if (inAll[u]) noSubAreaIn++; }
+  }
+  for (let u = raw.nU0; u < nU; u++) { areaOnlyNew++; if (inAll[u]) areaOnlyNewIn++; }
   const stamp = new Int32Array(nS).fill(-1);
   const profInfo = profs.map((c, p) => {
     let d = 0; for (const s of c.subs) if (stamp[s] !== p) { stamp[s] = p; d++; }
@@ -926,7 +939,7 @@ async function buildModel(ctx) {
   });
   MODEL = {
     nP, nU, nS, P: raw.P.names, U: raw.U.names, S: raw.S.names, profs, all, upPtr, upList, profInfo, area: AR,
-    ov: { rows: n, kept, couples, couples0: all0.subs.length, users: all.members.length, usersFile: nU, usersStored, subsUsed: upsNZ.length, rd, uniform, dominant,
+    ov: { rows: n, kept, couples, couples0: all0.subs.length, users: all.members.length, usersFile: raw.nU0, usersStored, noRights, noSubArea, noSubAreaIn, areaOnlyNew, areaOnlyNewIn, subsUsed: upsNZ.length, rd, uniform, dominant,
           spu: quantiles(spu), ups: quantiles(upsNZ), multi, consult }
   };
 }
@@ -1710,7 +1723,7 @@ function renderMapping() {
 async function parseAll() {
   showError('');
   if (!mapComplete(ST.map)) { showError('Choisissez au moins les colonnes Profil MyIAM, Utilisateur et Abonnement.'); $('#mapping').open = true; return; }
-  const raw = { P: new Interner(), U: new Interner(), S: new Interner(), store: new RowStore() };
+  const raw = { P: new Interner(), U: new Interner(), S: new Interner(), store: new RowStore(), noSub: new PairStore() };
   const stats = { lines: 0, skipped: 0, noUser: 0, noSub: 0, malformed: 0, unknownYN: new Map() };
   const consume = makeConsumer(raw, ST.map, stats);
   const t0 = now(); lastYield = now();
@@ -1731,7 +1744,7 @@ async function parseAll() {
       (same ? stats.sheets : stats.sheetsSkipped).push(sh.name);
     }
   }
-  raw.nS0 = raw.S.names.length;   // abonnements de l'extraction (les fichiers areas en ajoutent d'autres)
+  raw.nS0 = raw.S.names.length; raw.nU0 = raw.U.names.length; raw.nP0 = raw.P.names.length;   // éléments de l'extraction (les fichiers areas en ajoutent d'autres)
   ST.raw = raw; ST.rawStats = stats; ST.readMs = now() - t0;
   if (raw.store.n === 0) { $('#progress').hidden = true; showError('Aucune ligne exploitable : vérifiez les colonnes choisies.'); $('#mapping').open = true; return; }
   loadProgress('Préparation des données…', 1);
@@ -1910,7 +1923,7 @@ function areaOverviewCard() {
   else if (d.hasUA) {
     const via = d.effTot ? d.viaTot / d.effTot : 0, presentShare = d.given ? d.present / d.given : 1;
     kv.append(
-      h('dt', null, 'Personnes avec au moins une area'), h('dd', null, fmt(d.usersWithAreaInExtract) + ' (' + pct(d.usersWithAreaInExtract / (MODEL.ov.users || 1)) + ' des personnes)' + (AR.unknownUsers ? ' · ' + fmt(AR.unknownUsers) + ' absentes de l\u2019extraction' : '')),
+      h('dt', null, 'Personnes avec au moins une area'), h('dd', null, fmt(d.usersWithAreaInExtract) + (d.areaOnly ? ' · dont ' + fmt(d.areaOnly) + ' sans abonnement en direct' : '') + (AR.unknownUsers ? ' (' + fmt(AR.unknownUsers) + ' absentes de l\u2019extraction)' : '')),
       h('dt', null, 'Accès venant d\u2019une area attribuée'), h('dd', null, pct(via) + ' · attribué abonnement par abonnement : ' + pct(1 - via)),
       h('dt', null, 'Abonnements des areas attribuées présents dans l\u2019extraction'), h('dd', null, pct(presentShare) + (d.added ? ' · ' + fmt(d.added) + ' couples ajoutés à l\u2019accès actuel' : '')));
     lec.append(h('p', null, h('strong', null, pct(via) + ' de l\u2019accès'), ' vient d\u2019une area attribuée à la personne, ', h('strong', null, pct(1 - via)), ' d\u2019abonnements attribués un par un (accès réel : extraction et abonnements donnés par les areas).'));
@@ -1939,7 +1952,12 @@ function renderOverview() {
   const o = MODEL.ov, st = ST.rawStats;
   pane.append(h('div', { class: 'tiles' },
     tile('Lignes lues', fmt(st.lines), st.skipped ? fmt(st.skipped) + ' ' + agree(st.skipped, 'ignorée', 'ignorées') : 'aucune ignorée'),
-    tile('Personnes', fmt(o.users), o.usersFile > o.users ? 'sur ' + fmt(o.usersFile) + ' codes distincts dans le fichier (voir Qualité des données)' : (o.multi ? fmt(o.multi) + ' avec plusieurs profils' : 'un profil chacune')),
+    tile('Personnes', fmt(o.users), (() => {
+      const viaOnly = o.noSubAreaIn + o.areaOnlyNewIn, notCounted = o.usersFile - (o.users - o.areaOnlyNewIn), parts = [];
+      if (viaOnly) parts.push('dont ' + fmt(viaOnly) + ' sans abonnement en direct (accès par area)');
+      if (notCounted > 0) parts.push(fmt(notCounted) + ' ' + agree(notCounted, 'code', 'codes') + ' de l\u2019extraction non ' + agree(notCounted, 'compté', 'comptés') + ' (voir Qualité des données)');
+      return parts.length ? parts.join(' · ') : (o.multi ? fmt(o.multi) + ' avec plusieurs profils' : 'un profil chacune');
+    })()),
     tile('Profils MyIAM', fmt(MODEL.nP)),
     tile('Abonnements', fmt(o.subsUsed), 'avec au moins un droit'),
     tile('Couples personne × abonnement', fmt(o.couples), [o.kept > o.couples0 ? fmt(o.kept - o.couples0) + ' ' + agree(o.kept - o.couples0, 'doublon fusionné', 'doublons fusionnés') : null,
@@ -1980,9 +1998,15 @@ function renderOverview() {
 
   const warns = [];
   const warn = (...kids) => warns.push(h('div', { class: 'warnline' }, h('span', { class: 'ic', 'aria-hidden': 'true' }, '!'), h('span', null, ...kids)));
-  const noSubOnly = o.usersFile - o.usersStored, noRightsOnly = o.usersStored - o.users;
-  if (noSubOnly > 0) warn(h('strong', null, plural(noSubOnly, 'code utilisateur n\u2019apparaît', 'codes utilisateur n\u2019apparaissent') + ' que sur des lignes sans abonnement'),
-    ' (colonne abonnement vide, ' + plural(st.noSub, 'ligne', 'lignes') + ') : ' + agree(noSubOnly, 'cette personne n\u2019a', 'ces personnes n\u2019ont') + ' aucun périmètre à analyser et ' + agree(noSubOnly, 'n\u2019est pas comptée', 'ne sont pas comptées') + ' dans les ' + fmt(o.users) + ' personnes.');
+  const noSubOnly = o.usersFile - o.usersStored, noSubNoArea = noSubOnly - o.noSubArea, noRightsOnly = o.noRights, hasUA = !!(MODEL.area && MODEL.area.uPtr);
+  if (o.noSubArea) warn(h('strong', null, plural(o.noSubArea, 'code sans abonnement en direct accède', 'codes sans abonnement en direct accèdent') + ' par ' + agree(o.noSubArea, 'ses', 'leurs') + ' areas'),
+    o.noSubAreaIn === o.noSubArea ? ' : ' + agree(o.noSubArea, 'il est compté', 'ils sont comptés') + ', avec les abonnements de ' + agree(o.noSubArea, 'ses', 'leurs') + ' areas en consultation.'
+      : ' : cochez l\u2019option sous les fichiers areas pour ' + agree(o.noSubArea, 'le', 'les') + ' compter avec les abonnements de leurs areas.');
+  if (noSubNoArea > 0) warn(h('strong', null, plural(noSubNoArea, 'code utilisateur n\u2019apparaît', 'codes utilisateur n\u2019apparaissent') + ' que sur des lignes sans abonnement'),
+    hasUA ? ' et ' + agree(noSubNoArea, 'n\u2019a', 'n\u2019ont') + ' aucune area attribuée : aucun accès à analyser, ' + agree(noSubNoArea, 'il n\u2019est pas compté', 'ils ne sont pas comptés') + '.'
+      : ' : ' + agree(noSubNoArea, 'il n\u2019est pas compté', 'ils ne sont pas comptés') + '. Si leur accès passe par des subscription areas, chargez les fichiers abonnements ↔ areas et utilisateurs ↔ areas : ' + agree(noSubNoArea, 'il sera compté', 'ils seront comptés') + ' avec les abonnements de leurs areas.');
+  if (o.areaOnlyNew) warn(h('strong', null, plural(o.areaOnlyNew, 'personne du fichier utilisateurs ↔ areas est absente', 'personnes du fichier utilisateurs ↔ areas sont absentes') + ' de l\u2019extraction'),
+    o.areaOnlyNewIn ? ' : ' + agree(o.areaOnlyNew, 'elle est comptée', 'elles sont comptées') + ' sous le profil « (sans profil MyIAM · accès par area) », avec les abonnements de leurs areas en consultation.' : ' : non comptées tant que l\u2019option sous les fichiers areas est décochée.');
   if (noRightsOnly > 0) warn(h('strong', null, plural(noRightsOnly, 'personne n\u2019a', 'personnes n\u2019ont')), ' que des lignes sans aucun droit : exclues parce que l\u2019option « consultation » est désactivée.');
   if (st.noUser) warn(fmt(st.noUser) + ' ' + agree(st.noUser, 'ligne sans code utilisateur ignorée', 'lignes sans code utilisateur ignorées') + '.');
   if (st.malformed) warn(h('strong', null, fmt(st.malformed) + ' ' + agree(st.malformed, 'ligne', 'lignes')), ' avec un guillemet jamais refermé ' + agree(st.malformed, 'a été relue', 'ont été relues') + ' telle' + (st.malformed > 1 ? 's' : '') + ' quelle' + (st.malformed > 1 ? 's' : '') + ' : vérifiez-les dans le fichier.');
@@ -2224,7 +2248,7 @@ function renderScopeFilters(pending) {
 }
 function renderScopeFiltersInner(pending) {
   const ui = ST.ui, f = $('#scope-filters'); f.textContent = '';
-  const opts = MODEL.profInfo.slice().sort((a, b) => b.M - a.M);
+  const opts = MODEL.profInfo.filter(x => x.M > 0).sort((a, b) => b.M - a.M);
   const sel = h('select', { 'aria-label': 'Profil analysé', onchange: e => { ui.scope = +e.target.value; ui.kManual = false; ui.minUsers = null; ui.maxHeld = null; runScope(); } },
     h('option', { value: -1, selected: ui.scope === -1 ? true : null }, 'Tous les profils (' + fmt(MODEL.ov.users) + ' pers.)'),
     opts.map(x => h('option', { value: x.p, selected: ui.scope === x.p ? true : null }, MODEL.P[x.p] + ' (' + fmt(x.M) + ' pers.)')));
@@ -2361,7 +2385,7 @@ function renderScopeResults() {
       h('dt', null, 'Compter'), h('dd', null, '« Chaque personne » : la couverture est la moyenne, sur les personnes, de la part de leur périmètre que le profil redonne, et le choix des modules donne le même poids à chacune. « Chaque droit » : chaque couple personne × abonnement pèse autant, donc les périmètres très larges dominent.'),
       h('dt', null, 'Couverture'), h('dd', null, 'En « Chaque droit » : part des droits actuels (couples personne × abonnement) que le noyau et les modules redonnent. En « Chaque personne » : moyenne par personne.'),
       h('dt', null, 'Droits en trop'), h('dd', null, 'Droits que le noyau et les modules donneraient en plus de l’existant, rapportés aux droits actuels.'),
-      h('dt', null, 'Limite'), h('dd', null, 'L’analyse part des droits attribués aujourd’hui, pas de l’usage : un droit attribué mais jamais utilisé reste dans la proposition. À croiser avec les logs @pbl si vous les avez.'))));
+      h('dt', null, 'Limite'), h('dd', null, 'L’analyse part des droits attribués aujourd’hui, pas de l’usage : un droit attribué mais jamais utilisé reste dans la proposition. À croiser avec les logs NeoLink si vous les avez.'))));
 }
 /* --- vue « Analyser un profil » en subscription areas --- */
 function renderScopeResultsArea() {
@@ -3055,14 +3079,14 @@ function makeExample() {
       for (const s of subs) { const l = R() < 0.06 ? pickLv([0.42, 0.25, 0.12, 0.1, 0.07, 0.04]) : lv; lines.push([name, user, s, yn(l[0]), yn(l[1]), yn(l[2])]); }
     }
   };
-  team('@pbl_FA_LUX', 60, range(0, 8), [range(8, 18), range(18, 28), range(28, 38), range(38, 46)]);
-  team('@pbl_FA_PARIS', 42, range(0, 8), [range(8, 18), range(18, 28), range(28, 38), range(38, 46)]);
-  team('@pbl_CUSTODY_FR', 48, range(54, 66), [range(66, 76), range(76, 86), range(86, 95)], { reuse: usersOf['@pbl_FA_PARIS'].slice(0, 3) });
-  team('@pbl_CUSTODY_IT', 28, [], [], { individual: [95, 130], noise: 1 });
-  team('@pbl_TA_DUBLIN', 22, range(130, 140), [], { noise: 1 });
-  team('@pbl_SUPPORT_N2', 10, range(0, 140), [], { level: [0, 0, 0], noise: 0, keep: 0.99 });
+  team('NEOLINK_FA_LUX', 60, range(0, 8), [range(8, 18), range(18, 28), range(28, 38), range(38, 46)]);
+  team('NEOLINK_FA_PARIS', 42, range(0, 8), [range(8, 18), range(18, 28), range(28, 38), range(38, 46)]);
+  team('NEOLINK_CUSTODY_FR', 48, range(54, 66), [range(66, 76), range(76, 86), range(86, 95)], { reuse: usersOf['NEOLINK_FA_PARIS'].slice(0, 3) });
+  team('NEOLINK_CUSTODY_IT', 28, [], [], { individual: [95, 130], noise: 1 });
+  team('NEOLINK_TA_DUBLIN', 22, range(130, 140), [], { noise: 1 });
+  team('NEOLINK_SUPPORT_N2', 10, range(0, 140), [], { level: [0, 0, 0], noise: 0, keep: 0.99 });
   const csv = (ls, nm) => new File([ls.map(l => l.join(';')).join('\r\n')], nm, { type: 'text/csv' });
-  return { main: csv(lines, 'exemple_@pbl.csv'), subArea: csv(mapLines, 'exemple_abonnements_areas.csv'), userArea: csv(uaLines, 'exemple_utilisateurs_areas.csv') };
+  return { main: csv(lines, 'exemple_neolink.csv'), subArea: csv(mapLines, 'exemple_abonnements_areas.csv'), userArea: csv(uaLines, 'exemple_utilisateurs_areas.csv') };
 }
 
 /* ================================================================
