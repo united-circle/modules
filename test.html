@@ -409,19 +409,30 @@ function makeYN(unknown) {
   };
 }
 
+/* Un guillemet n'ouvre un champ entre guillemets qu'en début de champ (RFC 4180) ; ailleurs, c'est un caractère ordinaire. */
 function splitQuoted(line, d) {
-  const out = []; let cur = '', q = false;
+  const out = []; let cur = '', q = false, fs = true;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
-    if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
-    else if (c === '"') q = true;
-    else if (c === d) { out.push(cur); cur = ''; }
-    else cur += c;
+    if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; continue; }
+    if (c === '"' && fs) { q = true; fs = false; continue; }
+    if (c === d) { out.push(cur); cur = ''; fs = true; continue; }
+    cur += c; fs = false;
   }
   out.push(cur);
   return out;
 }
-function quotesBalanced(s) { let c = 0, i = s.indexOf('"'); while (i !== -1) { c++; i = s.indexOf('"', i + 1); } return (c & 1) === 0; }
+/* La ligne se termine-t-elle à l'intérieur d'un champ entre guillemets (retour à la ligne dans une valeur) ? */
+function endsInQuote(line, d, inside) {
+  let q = inside, fs = !inside;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === '"') { if (line[i + 1] === '"') i++; else q = false; } fs = false; continue; }
+    if (c === '"' && fs) { q = true; fs = false; continue; }
+    fs = c === d;
+  }
+  return q;
+}
 
 async function sniff(file) {
   const b = new Uint8Array(await file.slice(0, 4).arrayBuffer());
@@ -441,16 +452,29 @@ async function csvPrep(file) {
   return { enc, delim, headers: splitQuoted(hl, delim).map(s => s.trim()) };
 }
 
-async function parseCsv(file, enc, delim, onFields, onProgress) {
+async function parseCsv(file, enc, delim, onFields, onProgress, stats) {
   const reader = file.stream().getReader();
   const dec = new TextDecoder(enc);
-  let carry = '', bytes = 0, first = true, header = false, pending = null;
-  const line = (l, force) => {
-    if (pending !== null) { pending += '\n' + l; if (!force && !quotesBalanced(pending)) return; l = pending; pending = null; }
-    else if (!force && l.indexOf('"') !== -1 && !quotesBalanced(l)) { pending = l; return; }
+  let carry = '', bytes = 0, first = true, header = false, pending = null, pendN = 0;
+  const emit = l => {
     if (!header) { if (l.trim() !== '') header = true; return; }
     if (l.length === 0) return;
     onFields(l.indexOf('"') === -1 ? l.split(delim) : splitQuoted(l, delim));
+  };
+  const line = (l, force) => {
+    if (pending !== null) {
+      pending.push(l); pendN++;
+      if (!force && endsInQuote(l, delim, true) && pendN < 50) return;
+      const lines = pending; pending = null; pendN = 0;
+      if (force || endsInQuote(lines[lines.length - 1], delim, true)) {   // guillemet jamais refermé : lignes relues une par une
+        if (stats) stats.malformed = (stats.malformed || 0) + lines.length;
+        for (const x of lines) emit(x.split(delim).map(v => v.replace(/^"|"$/g, '')).join(delim));
+        return;
+      }
+      emit(lines.join('\n')); return;
+    }
+    if (!force && l.indexOf('"') !== -1 && endsInQuote(l, delim, false)) { pending = [l]; pendN = 1; return; }
+    emit(l);
   };
   for (;;) {
     const { done, value } = await reader.read();
@@ -467,7 +491,7 @@ async function parseCsv(file, enc, delim, onFields, onProgress) {
     carry = s.slice(start);
     if (done) {
       if (carry.length) { let l = carry; if (l.charCodeAt(l.length - 1) === 13) l = l.slice(0, -1); line(l); }
-      if (pending !== null) { const p = pending; pending = null; line(p, true); }
+      if (pending !== null) line('', true);
       break;
     }
     if (onProgress) await onProgress(bytes / (file.size || 1));
@@ -523,6 +547,31 @@ function richText(block) {
   let out = '', m; T_RE.lastIndex = 0;
   while ((m = T_RE.exec(block)) !== null) out += m[1];
   return xmlUnesc(out);
+}
+/* Feuilles du classeur, dans l'ordre des onglets */
+async function allSheets(buf, entries) {
+  const out = [];
+  try {
+    const wbE = entries.get('xl/workbook.xml'), relE = entries.get('xl/_rels/workbook.xml.rels');
+    if (wbE && relE) {
+      const wb = await readEntryText(buf, wbE), rels = await readEntryText(buf, relE), target = new Map();
+      const re = /<Relationship\b([^>]*)\/?>/g; let r;
+      while ((r = re.exec(rels)) !== null) {
+        const id = /\bId="([^"]+)"/.exec(r[1]), tg = /\bTarget="([^"]+)"/.exec(r[1]);
+        if (id && tg) { let t = tg[1]; t = t.startsWith('/') ? t.slice(1) : 'xl/' + t.replace(/^\.\//, ''); target.set(id[1], t); }
+      }
+      const sre = /<sheet\b([^>]*)\/?>/g; let m;
+      while ((m = sre.exec(wb)) !== null) {
+        const rid = /\br:id="([^"]+)"/.exec(m[1]), nm = /\bname="([^"]*)"/.exec(m[1]), t = rid && target.get(rid[1]);
+        if (t && entries.has(t)) out.push({ name: nm ? xmlUnesc(nm[1]) : t, path: t });
+      }
+    }
+  } catch (_) {}
+  if (!out.length) {
+    const p = await firstSheetPath(buf, entries);
+    if (p) out.push({ name: p, path: p });
+  }
+  return out;
 }
 async function firstSheetPath(buf, entries) {
   try {
@@ -605,7 +654,8 @@ async function xlsxPrep(file) {
   let headers = null;
   await parseSheet(buf, sheet, sst, cells => { if (rowHasData(cells)) { headers = Array.from(cells, v => v == null ? '' : String(v).trim()); return false; } }, null);
   if (!headers) throw new Error("Impossible de trouver la ligne d'en-tête dans la première feuille.");
-  return { buf, sheet, sst, headers };
+  const sheets = (await allSheets(buf, entries)).map(x => ({ name: x.name, entry: entries.get(x.path) }));
+  return { buf, sheet, sst, headers, sheets: sheets.length ? sheets : [{ name: 'Feuille 1', entry: sheet }] };
 }
 
 /* --- correspondance des colonnes --- */
@@ -638,7 +688,7 @@ function makeConsumer(raw, map, stats) {
     const uv = f[iu], sv0 = f[is];
     const u = uv == null ? '' : String(uv).trim();
     const s = sv0 == null ? '' : String(sv0).trim();
-    if (!u || !s) { stats.skipped++; return; }
+    if (!u || !s) { stats.skipped++; if (!u) stats.noUser++; else { stats.noSub++; U.id(u); } return; }
     const pv = f[ip];
     const p = (pv == null ? '' : String(pv).trim()) || '(sans profil)';
     const r = (ii >= 0 ? yn(f[ii]) : 0) | (iv >= 0 ? yn(f[iv]) << 1 : 0) | (isd >= 0 ? yn(f[isd]) << 2 : 0);
@@ -867,6 +917,8 @@ async function buildModel(ctx) {
   const ups = new Int32Array(nS); for (let j = 0; j < couples; j++) ups[all.subs[j]]++;
   const upsNZ = []; for (let s = 0; s < nS; s++) if (ups[s] > 0) upsNZ.push(ups[s]);
   let multi = 0; for (let u = 0; u < nU; u++) if (upPtr[u + 1] - upPtr[u] >= 2) multi++;
+  const storedU = new Uint8Array(nU); for (let i = 0; i < n; i++) storedU[st.u[i]] = 1;
+  let usersStored = 0; for (let u = 0; u < nU; u++) usersStored += storedU[u];
   const stamp = new Int32Array(nS).fill(-1);
   const profInfo = profs.map((c, p) => {
     let d = 0; for (const s of c.subs) if (stamp[s] !== p) { stamp[s] = p; d++; }
@@ -874,7 +926,7 @@ async function buildModel(ctx) {
   });
   MODEL = {
     nP, nU, nS, P: raw.P.names, U: raw.U.names, S: raw.S.names, profs, all, upPtr, upList, profInfo, area: AR,
-    ov: { rows: n, kept, couples, couples0: all0.subs.length, users: all.members.length, subsUsed: upsNZ.length, rd, uniform, dominant,
+    ov: { rows: n, kept, couples, couples0: all0.subs.length, users: all.members.length, usersFile: nU, usersStored, subsUsed: upsNZ.length, rd, uniform, dominant,
           spu: quantiles(spu), ups: quantiles(upsNZ), multi, consult }
   };
 }
@@ -1659,15 +1711,25 @@ async function parseAll() {
   showError('');
   if (!mapComplete(ST.map)) { showError('Choisissez au moins les colonnes Profil MyIAM, Utilisateur et Abonnement.'); $('#mapping').open = true; return; }
   const raw = { P: new Interner(), U: new Interner(), S: new Interner(), store: new RowStore() };
-  const stats = { lines: 0, skipped: 0, unknownYN: new Map() };
+  const stats = { lines: 0, skipped: 0, noUser: 0, noSub: 0, malformed: 0, unknownYN: new Map() };
   const consume = makeConsumer(raw, ST.map, stats);
   const t0 = now(); lastYield = now();
   const onProg = async f => { if (now() - lastYield > 60) { lastYield = now(); loadProgress('Lecture… ' + fmt(stats.lines) + ' lignes', f); await sleep0(); } };
   loadProgress('Lecture… 0 ligne', 0);
-  if (ST.kind === 'csv') await parseCsv(ST.file, ST.enc, ST.delim, consume, onProg);
+  if (ST.kind === 'csv') await parseCsv(ST.file, ST.enc, ST.delim, consume, onProg, stats);
   else {
-    let header = false;
-    await parseSheet(ST.xlsx.buf, ST.xlsx.sheet, ST.xlsx.sst, cells => { if (!header) { if (rowHasData(cells)) header = true; return; } consume(cells); }, onProg);
+    // toutes les feuilles qui ont les mêmes colonnes que la première (une extraction de plus d'un million de lignes est souvent répartie sur plusieurs feuilles)
+    const sig = ST.xlsx.headers.map(normH).join('|');
+    stats.sheets = []; stats.sheetsSkipped = [];
+    for (const sh of ST.xlsx.sheets) {
+      let header = null, same = true;
+      await parseSheet(ST.xlsx.buf, sh.entry, ST.xlsx.sst, cells => {
+        if (header === null) { if (rowHasData(cells)) { header = Array.from(cells, v => v == null ? '' : String(v).trim()); same = header.map(normH).join('|') === sig; if (!same) return false; } return; }
+        consume(cells);
+      }, onProg);
+      if (header === null) continue;
+      (same ? stats.sheets : stats.sheetsSkipped).push(sh.name);
+    }
   }
   raw.nS0 = raw.S.names.length;   // abonnements de l'extraction (les fichiers areas en ajoutent d'autres)
   ST.raw = raw; ST.rawStats = stats; ST.readMs = now() - t0;
@@ -1702,8 +1764,8 @@ function renderFileInfo() {
   fi.append(...[
     h('span', null, h('strong', null, ST.file.name)),
     h('span', null, fmt(st.lines) + ' lignes lues en ' + (() => { const s = (ST.readMs + (ST.buildMs || 0)) / 1000; return s < 0.1 ? 'moins de 0,1 s' : fmt1(s) + ' s'; })()),
-    ST.kind === 'csv' ? h('span', null, 'séparateur ' + delimName + ' · ' + (ST.enc === 'utf-8' ? 'UTF-8' : 'Windows-1252')) : h('span', null, 'Excel, première feuille'),
-    st.skipped ? h('span', null, fmt(st.skipped) + ' ' + agree(st.skipped, 'ligne ignorée', 'lignes ignorées') + ' (utilisateur ou abonnement vide)') : null
+    ST.kind === 'csv' ? h('span', null, 'séparateur ' + delimName + ' · ' + (ST.enc === 'utf-8' ? 'UTF-8' : 'Windows-1252')) : h('span', null, 'Excel · ' + (st.sheets && st.sheets.length > 1 ? plural(st.sheets.length, 'feuille lue', 'feuilles lues') + ' (' + st.sheets.join(', ') + ')' : 'une feuille')),
+    st.skipped ? h('span', null, fmt(st.skipped) + ' ' + agree(st.skipped, 'ligne ignorée', 'lignes ignorées') + ' (' + [st.noSub ? fmt(st.noSub) + ' sans abonnement' : null, st.noUser ? fmt(st.noUser) + ' sans utilisateur' : null].filter(Boolean).join(', ') + ')') : null
   ].filter(Boolean));
   fi.hidden = false;
 }
@@ -1877,7 +1939,7 @@ function renderOverview() {
   const o = MODEL.ov, st = ST.rawStats;
   pane.append(h('div', { class: 'tiles' },
     tile('Lignes lues', fmt(st.lines), st.skipped ? fmt(st.skipped) + ' ' + agree(st.skipped, 'ignorée', 'ignorées') : 'aucune ignorée'),
-    tile('Personnes', fmt(o.users), o.multi ? fmt(o.multi) + ' avec plusieurs profils' : 'un profil chacune'),
+    tile('Personnes', fmt(o.users), o.usersFile > o.users ? 'sur ' + fmt(o.usersFile) + ' codes distincts dans le fichier (voir Qualité des données)' : (o.multi ? fmt(o.multi) + ' avec plusieurs profils' : 'un profil chacune')),
     tile('Profils MyIAM', fmt(MODEL.nP)),
     tile('Abonnements', fmt(o.subsUsed), 'avec au moins un droit'),
     tile('Couples personne × abonnement', fmt(o.couples), [o.kept > o.couples0 ? fmt(o.kept - o.couples0) + ' ' + agree(o.kept - o.couples0, 'doublon fusionné', 'doublons fusionnés') : null,
@@ -1917,6 +1979,14 @@ function renderOverview() {
   pane.append(g);
 
   const warns = [];
+  const warn = (...kids) => warns.push(h('div', { class: 'warnline' }, h('span', { class: 'ic', 'aria-hidden': 'true' }, '!'), h('span', null, ...kids)));
+  const noSubOnly = o.usersFile - o.usersStored, noRightsOnly = o.usersStored - o.users;
+  if (noSubOnly > 0) warn(h('strong', null, plural(noSubOnly, 'code utilisateur n\u2019apparaît', 'codes utilisateur n\u2019apparaissent') + ' que sur des lignes sans abonnement'),
+    ' (colonne abonnement vide, ' + plural(st.noSub, 'ligne', 'lignes') + ') : ' + agree(noSubOnly, 'cette personne n\u2019a', 'ces personnes n\u2019ont') + ' aucun périmètre à analyser et ' + agree(noSubOnly, 'n\u2019est pas comptée', 'ne sont pas comptées') + ' dans les ' + fmt(o.users) + ' personnes.');
+  if (noRightsOnly > 0) warn(h('strong', null, plural(noRightsOnly, 'personne n\u2019a', 'personnes n\u2019ont')), ' que des lignes sans aucun droit : exclues parce que l\u2019option « consultation » est désactivée.');
+  if (st.noUser) warn(fmt(st.noUser) + ' ' + agree(st.noUser, 'ligne sans code utilisateur ignorée', 'lignes sans code utilisateur ignorées') + '.');
+  if (st.malformed) warn(h('strong', null, fmt(st.malformed) + ' ' + agree(st.malformed, 'ligne', 'lignes')), ' avec un guillemet jamais refermé ' + agree(st.malformed, 'a été relue', 'ont été relues') + ' telle' + (st.malformed > 1 ? 's' : '') + ' quelle' + (st.malformed > 1 ? 's' : '') + ' : vérifiez-les dans le fichier.');
+  if (st.sheetsSkipped && st.sheetsSkipped.length) warn('Feuilles ignorées car leurs colonnes diffèrent de la première : ' + st.sheetsSkipped.join(', ') + '.');
   if (st.unknownYN.size) {
     const top = [...st.unknownYN.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
     warns.push(h('div', { class: 'warnline' }, h('span', { class: 'ic', 'aria-hidden': 'true' }, '!'),
